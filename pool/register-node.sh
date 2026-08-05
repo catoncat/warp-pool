@@ -11,6 +11,7 @@ mkdir -p "$NODES_DIR"
 
 PRIV=$(wg genkey)
 PUB=$(echo "$PRIV" | wg pubkey)
+SN=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
 RESP=""
 # CF-Client-Version 是 WARP 注册 API 的客户端版本头，Cloudflare 更新后旧版本会失效；
 # 失效时报 403/400 时，换成最新版 app 的版本号（可用抓包或社区公布的当前值）。
@@ -18,7 +19,7 @@ for attempt in 1 2 3 4; do
   RESP=$(curl -sS -m 20 -X POST https://api.cloudflareclient.com/v0a2483/reg \
     -H "CF-Client-Version: a-6.81-2410032352.1" \
     -H "Content-Type: application/json" \
-    -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"key\":\"$PUB\",\"fcm_token\":\"\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"zh_CN\"}") && break
+    -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"key\":\"$PUB\",\"fcm_token\":\"\",\"serial_number\":\"$SN\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"zh_CN\"}") && break
   echo "[register] attempt $attempt failed, backoff" >&2
   sleep $((attempt*10))
 done
