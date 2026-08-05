@@ -504,6 +504,11 @@ class Handler(BaseHTTPRequestHandler):
         for m in req.get("messages", []):
             if m.get("role") == "developer":
                 m["role"] = "system"
+        # 网关兜底: DeepSeek 上游要求 thinking 历史里每条 assistant 消息都带
+        # reasoning_content 字段(空串即可); pi 未配 compat 时可能缺字段→400, 这里补上
+        for m in req.get("messages", []):
+            if m.get("role") == "assistant" and "reasoning_content" not in m:
+                m["reasoning_content"] = ""
         if stream:
             req.setdefault("stream_options", {})["include_usage"] = True
             payload = json.dumps(req).encode()
