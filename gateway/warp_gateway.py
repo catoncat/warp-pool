@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
     "nodes_state_file": os.path.join(STATE_DIR, "nodes.json"),
     "usage_log": os.path.join(STATE_DIR, "usage.jsonl"),
     "max_concurrent": 8,
-    "max_attempts": 4,
+    "max_attempts": 15,
     "connect_timeout": 15,
     "read_timeout": 300,
     "models_cache_sec": 300,
