@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 节点看门狗: 每节点经 socks5(强制 IPv6 出口) 探测 zen /models;
+# 节点看门狗: 每节点经 socks5(域名模式, hosts 钉 IPv6 → 唯一 v6 出口) 探测 zen /models;
 # 失败→重启单元; 连续失败≥3→重新注册设备(换全新 IP, 顺带吃新 IP 2x 配额)
 # 全池 0 健康连续两轮→全池重拨(换全新 15 个 IP)
 # 状态写 state/nodes.json 供网关跳过坏节点
@@ -18,8 +18,9 @@ out="{}"
 ok_count=0
 for port in $PORTS; do
   ok=false
-  # -6 --socks5: 本地解析 AAAA → socks 目标为 IPv6 字面量 → 走唯一 v6 出口(不污染共享 v4)
-  ip=$(curl -sS -m 15 -6 --socks5 "127.0.0.1:$port" \
+  # --socks5-hostname: 域名目标交给 wireproxy 解析(wireproxy 不支持 IPv6 字面量 ATYP=4),
+  # hosts 钉了 opencode.ai→AAAA 所以仍走每节点唯一 v6 出口, 与网关主链路同机制
+  ip=$(curl -sS -m 15 --socks5-hostname "127.0.0.1:$port" \
        https://opencode.ai/zen/v1/models -o /dev/null -w "%{http_code}" 2>/dev/null || true)
   if [ "$ip" = "200" ]; then
     ok=true; ok_count=$((ok_count+1))
