@@ -289,6 +289,7 @@ class UsageTracker:
 # ---------- 网关 ----------
 
 CFG = load_config()
+DEBUG = os.environ.get("WARP_DEBUG") == "1"  # 诊断日志开关(默认关, 公开版无输出)
 KEYS = KeyStore(CFG["keys_file"])
 POOL = NodePool(CFG)
 USAGE = UsageTracker(CFG["usage_log"])
@@ -490,6 +491,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         model = req.get("model", "")
         stream = bool(req.get("stream"))
+        if DEBUG:  # 调试: 记录会触发上游 thinking 校验的请求形态(只打结构, 不打内容)
+            try:
+                a = [m.get("role") for m in req.get("messages", [])]
+                rc = [len(m.get("reasoning_content") or "") for m in req.get("messages", []) if m.get("reasoning_content")]
+                tk = [bool(m.get("tool_calls")) for m in req.get("messages", []) if m.get("role") == "assistant"]
+                print(f"[req] model={model} stream={stream} thinking={req.get('thinking')} "
+                      f"roles={a} rc_len={rc} asst_toolcalls={tk}", flush=True)
+            except Exception:
+                pass
         # pi/Claude 系客户端对 reasoning 模型会发 developer role, zen 只认 system
         for m in req.get("messages", []):
             if m.get("role") == "developer":
