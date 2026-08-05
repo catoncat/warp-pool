@@ -1,0 +1,14 @@
+[Unit]
+Description=warp-pool gateway (OpenAI-compatible zen front)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/warp-pool/gateway/warp_gateway.py
+Restart=always
+RestartSec=3
+MemoryMax=256M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

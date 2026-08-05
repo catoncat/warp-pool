@@ -1,0 +1,14 @@
+[Unit]
+Description=wireproxy WARP node (port %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/warp-pool/bin/wireproxy -c /opt/warp-pool/nodes/node-%i.conf
+Restart=always
+RestartSec=3
+MemoryMax=64M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

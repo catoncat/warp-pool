@@ -1,0 +1,9 @@
+{
+  "listen": "0.0.0.0:10900",
+  "node_ports": [],
+  "max_concurrent": 8,
+  "max_attempts": 15,
+  "free_only": true,
+  "spoof_headers": true,
+  "opencode_version": "1.0.152"
+}

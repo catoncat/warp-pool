@@ -1,0 +1,6 @@
+[Unit]
+Description=warp-pool node watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/opt/warp-pool/pool/health.sh
