@@ -34,7 +34,7 @@ Client ──► 你的网关 :10900 (key 认证, 全局并发 N)
 - 一台 Linux VPS（作者用 OpenCloudOS 验证；Debian/Ubuntu 同理），能访问 `api.cloudflareclient.com` 与上游端点
 - 依赖：`python3`（无第三方库）、`curl`、`wireguard-tools`（`wg genkey`）、`systemd`
 - 可选：域名 + Caddy/nginx 反代 TLS（网关默认明文 HTTP）
-- 可选（推荐）：机器有 IPv6 连通性 —— 网关会把上游解析成 IPv6 字面量，强制走每节点唯一的 IPv6 出口，限流规避效果最好；无 IPv6 时自动回退域名出口
+- 可选（推荐）：机器有 IPv6 连通性。把上游主机名在 `/etc/hosts` 钉到一个 IPv6 地址（AAAA），`wireproxy` 解析域名时会命中 hosts、使每个节点走**每节点唯一的 IPv6 出口**，限流规避效果最好；不钉则走节点本机默认出口族（IPv4 是多节点共享 NAT 池，容易撞限流）
 
 ## 快速部署（一键）
 
@@ -122,6 +122,7 @@ curl -H "Authorization: Bearer $KEY" https://your.domain/v1/chat/completions \
 
 - 看门狗（`warp-pool-health.timer`，每 5 分钟）：探测失败 → 重启单元；连续 3 次失败 → **重拨注册新设备**（换全新 IP）；全池 0 健康连续两轮 → 整池重拨。**自动换 IP 是设计行为，不是故障**
 - 节点池状态实时可查：`curl -H "Authorization: Bearer $KEY" <gateway>/stats`
+- 诊断：`systemctl edit warp-gateway` 加 `Environment=WARP_DEBUG=1` 可开启请求形态日志（只打结构不打内容：model / thinking / 历史消息里 reasoning_content 长度），排查 400 thinking 校验等上游兼容问题时用；默认关闭
 
 ## 把节点池当通用 SOCKS5 代理池
 
