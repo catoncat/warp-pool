@@ -1,0 +1,11 @@
+# 忽略仅构建无关的内容(镜像只 COPY gateway/pool/etc + deploy/fly 脚本)
+.git
+state/
+nodes/
+exports/
+docs/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+*.md
