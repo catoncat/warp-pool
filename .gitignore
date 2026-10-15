@@ -1,0 +1,18 @@
+# 运行时产物 & 本地留档
+exports/
+state/
+nodes/
+gateway/keys.txt
+data/
+.pi-rlm/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+
+# 内部运维文档（保留在磁盘供本地使用，不进公开仓库）
+docs/STATUS.md
+AGENTS.md

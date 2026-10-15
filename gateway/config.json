@@ -1,0 +1,10 @@
+{
+  "listen": "0.0.0.0:10900",
+  "node_ports": [],
+  "max_concurrent": 8,
+  "max_attempts": 15,
+  "free_only": true,
+  "spoof_headers": true,
+  "default_quota": 40,
+  "quota_ratio": 0.85
+}

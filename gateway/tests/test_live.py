@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""集成测试: 真实 warp-pool 网关端到端行为验证。
+
+默认连真实网关与真实上游。
+用法:
+    python3 tests/test_live.py                    # 生产(默认)
+    python3 tests/test_live.py --gateway http://host:10900 --key KEY
+退出码: 0=全过; 1=有失败。
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_GATEWAY = "http://127.0.0.1:10900"
+
+def default_key():
+    # key 来源: 环境变量 WARP_TEST_KEY, 或部署时回传的 exports/gateway-key.txt
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "../../exports/gateway-key.txt")) as f:
+            k = f.read().strip()
+        if k:
+            return k
+    except FileNotFoundError:
+        pass
+    return os.environ.get("WARP_TEST_KEY", "")
+
+class LiveGateway:
+    def __init__(self, gw, key):
+        self.gw = gw.rstrip("/")
+        self.key = key
+        self.base = self.gw + "/v1"
+
+    def _do(self, url, method, body=None, headers=None, timeout=180):
+        h = {"Content-Type": "application/json"}
+        if self.key:
+            h["Authorization"] = "Bearer " + self.key
+        if headers:
+            h.update(headers)
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(url, data=data, headers=h, method=method)
+        try:
+            resp = urllib.request.urlopen(r, timeout=timeout)
+            return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def req(self, method, path, body=None, headers=None, timeout=180):
+        return self._do(self.base + path, method, body, headers, timeout)
+
+    def req_raw(self, method, path, body=None, headers=None, timeout=180):
+        """网关根路径(healthz/stats 不走 /v1)。"""
+        return self._do(self.gw + path, method, body, headers, timeout)
+
+    def chat(self, messages, stream=False, max_tokens=32, timeout=180):
+        return self.req("POST", "/chat/completions", {
+            "model": "deepseek-v4-flash-free",
+            "stream": stream, "max_tokens": max_tokens, "messages": messages,
+        }, timeout=timeout)
+
+    def stat(self):
+        status, h, b = self.req_raw("GET", "/stats", None, timeout=10)
+        return json.loads(b) if status == 200 else {}
+
+def conv_msgs(prefix_sys, first_user, turn):
+    """模拟真实对话: 固定前缀 + 追加历史轮次。"""
+    msgs = [{"role": "system", "content": prefix_sys},
+            {"role": "user", "content": first_user}]
+    for i in range(turn):
+        msgs += [{"role": "assistant", "content": "第%d轮回复" % i, "reasoning_content": ""},
+                 {"role": "user", "content": "第%d轮追问" % i}]
+    return msgs
+
+PASS = 0
+FAIL = 0
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  PASS %s%s" % (name, ("  [" + detail + "]" if detail else "")))
+    else:
+        FAIL += 1
+        print("  FAIL %s%s" % (name, ("  [" + detail + "]" if detail else "")))
+
+def sse_parse(body: bytes):
+    """解析 SSE 流: 返回 (chunks, usage)。"""
+    chunks, usage = [], None
+    for line in body.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data: "):
+            continue
+        payload = line[6:]
+        if payload == b"[DONE]":
+            continue
+        try:
+            d = json.loads(payload)
+            delta = (d.get("choices") or [{}])[0].get("delta", {})
+            if delta.get("content"):
+                chunks.append(delta["content"])
+            if d.get("usage"):
+                usage = d["usage"]
+        except Exception:
+            pass
+    return "".join(chunks), usage
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gateway", default=DEFAULT_GATEWAY, help="网关地址(默认本地隧道→生产)")
+    ap.add_argument("--key", default=None, help="API key(默认本地 secret)")
+    args = ap.parse_args()
+    key = args.key or default_key()
+    if not key:
+        print("错误: 未找到 API key(传 --key 或设置 WARP_TEST_KEY)"); sys.exit(1)
+    g = LiveGateway(args.gateway, key)
+    print("== 集成测试 vs 真实网关: %s ==" % args.gateway)
+
+    # 1) healthz
+    status, h, b = g.req_raw("GET", "/healthz", None, timeout=10)
+    check("healthz 200+ok", status == 200 and b"ok" in b, str(status))
+
+    # 2) 401 无 key(原生裸请求, 不带 Authorization)
+    try:
+        resp = urllib.request.urlopen(urllib.request.Request(g.gw + "/stats", method="GET"), timeout=10)
+        status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    check("无 key → 401", status == 401, str(status))
+    status, h, b = g.req("POST", "/chat/completions", {"model": "x"}, timeout=10)
+    check("无 key chat → 401", status == 401, str(status))
+
+    # 3) 非流式
+    status, h, b = g.chat([{"role": "user", "content": "用一句话说你好"}], stream=False)
+    ok = status == 200 and b"choices" in b
+    detail = "node=%s" % h.get("X-Warp-Pool-Node", "?")
+    check("非流式 200", ok, detail)
+
+    # 4) 流式 SSE (max_tokens 足够大, thinking 模型先出 reasoning 再出 content)
+    status, h, b = g.chat([{"role": "user", "content": "数到五, 用数字列出"}], stream=True, max_tokens=128)
+    chunks, usage = sse_parse(b)
+    check("流式 SSE 有内容+usage", status == 200 and chunks and usage is not None,
+          "chars=%d usage=%s node=%s" % (len(chunks), bool(usage), h.get("X-Warp-Pool-Node", "?")))
+
+    # 5) 会话指纹粘性: 同对话同节点; 不同对话分散
+    convs = [("sys-测试对话A", "项目A的需求是什么"),
+             ("sys-测试对话B", "帮我看一下配置"),
+             ("sys-测试对话C", "写个小脚本")]
+    nodes = {}
+    for ci, (s, u) in enumerate(convs):
+        nodes[ci] = []
+        for turn in range(3):
+            status, h, b = g.chat(conv_msgs(s, u, turn), stream=False, max_tokens=16)
+            n = h.get("X-Warp-Pool-Node", "?")
+            nodes[ci].append(n)
+    same_conv_stable = all(len(set(v)) == 1 for v in nodes.values())
+    spread = len(set(v[0] for v in nodes.values())) >= 2
+    check("同对话粘同节点", same_conv_stable, "A=%s B=%s C=%s" % (nodes[0][0], nodes[1][0], nodes[2][0]))
+    check("不同对话分散", spread, "节点数=%d" % len(set(v[0] for v in nodes.values())))
+
+    # 6) 缓存命中: 同对话重复前缀 → 命中(核心承诺, 硬断言)
+    #    zen 对 <500 tokens 的短请求不返回 cache 字段, 用 ~800 tokens 长文本
+    long_text = ("这是一段用于验证前缀缓存的较长文本。服务器应该对重复出现的前缀命中缓存，"
+                 "从而显著降低首字延迟。我们需要足够的长度才能观察到缓存字段。" * 25)
+    msgs = [{"role": "system", "content": "sys-缓存测试"},
+            {"role": "user", "content": long_text}]
+    hits = []
+    for i in range(3):
+        status, h, b = g.chat(msgs, stream=False, max_tokens=8)
+        try:
+            u = json.loads(b).get("usage", {})
+            hit = u.get("prompt_cache_hit_tokens", 0) or 0
+            miss = u.get("prompt_cache_miss_tokens", 0) or 0
+            if not hit and not miss:  # OpenAI 标准格式兼容
+                ptd = u.get("prompt_tokens_details") or {}
+                hit = ptd.get("cached_tokens", 0) or 0
+                miss = max(0, (u.get("prompt_tokens") or 0) - hit)
+            hits.append((hit, miss))
+        except Exception:
+            hits.append((0, 0))
+        if i == 0:
+            time.sleep(0.5)
+    hit_ok = any(h[0] > 0 and h[0] > h[1] for h in hits[1:])
+    check("缓存命中(重复请求)", hit_ok,
+          "演进=" + ",".join("hit=%d/miss=%d" % h for h in hits))
+
+    print()
+    print("集成测试结果: %d 过 / %d 失败" % (PASS, FAIL))
+    sys.exit(1 if FAIL else 0)
+
+if __name__ == "__main__":
+    main()

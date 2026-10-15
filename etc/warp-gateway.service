@@ -1,0 +1,15 @@
+[Unit]
+Description=warp-pool gateway (OpenAI-compatible zen front)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 部署机系统 python3 若为 3.9 会崩(代码用 X|None 语法), 需 python3.11
+ExecStart=/usr/bin/python3.11 /opt/warp-pool/gateway/warp_gateway.py
+Restart=always
+RestartSec=3
+MemoryMax=256M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

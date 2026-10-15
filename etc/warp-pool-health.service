@@ -1,0 +1,9 @@
+[Unit]
+Description=warp-pool node watchdog
+
+[Service]
+Type=oneshot
+# 配额轮换一轮最多 4 端口 × (注册+启动+50s 节流) ≈ 4 分钟, 超过系统默认 90s
+# (2026-08-19: 默认超时会腰斩轮换, 留下 stop 未 start 的节点)
+TimeoutStartSec=600
+ExecStart=/opt/warp-pool/pool/health.sh
