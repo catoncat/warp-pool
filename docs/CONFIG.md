@@ -13,6 +13,7 @@
 | `max_concurrent` | `8` | 并发「建连槽」数（信号量只锁建连+等响应头阶段，长流不占槽） |
 | `queue_timeout` | `15` | 排队等建连槽的最长秒数，超时 503 快速失败（不无限阻塞） |
 | `ttft_timeout` | `25` | 上游首字节（TTFT）最长等待，超时换节点 |
+| `first_event_timeout` | `15` | 流内「连续无字节」上限；超时当节点故障换节点（`0`=关闭）。上游在思考期间每 ~5s 发一次 `: keep-alive`，所以 15s 只打到真挂死的节点 |
 | `max_attempts` | `15` | 单请求最多尝试节点数（换节点重试） |
 | `connect_timeout` / `read_timeout` | `15` / `300` | 连接 / 流式读超时 |
 | `max_body_bytes` | `64MB` | 请求体上限，超过返回 413（防超大 Content-Length 拖住线程） |
@@ -22,7 +23,7 @@
 | `models_cache_sec` | `300` | `/v1/models` 上游结果缓存秒数 |
 | `free_only` | `true` | 只透传 model id 以 `-free` 结尾的模型 |
 | `spoof_headers` | `true` | 伪装官方 CLI 请求头（协议要求的 `x-<品牌>-*` 头名逐字见代码；上游按这些头判定请求来源） |
-| `0penc0de_version` | 见代码默认（需近期版本） | 伪装头里的版本号；过旧会被上游拒（426） |
+| `opencode_version` | 见代码默认（需近期版本） | 伪装头里的版本号；过旧会被上游拒（426）。键名与 UA 前缀是协议字面量，见 `UPSTREAM_GATE.md` |
 
 ## 客户端使用
 
@@ -39,5 +40,7 @@ curl -H "Authorization: Bearer $KEY" https://your.domain/v1/chat/completions \
 - 请求体：缺 `Content-Length` / 空体 / CL 非法 → 400；超过 `max_body_bytes` → 413
 - `GET /healthz` 无鉴权健康检查（进程活着即 200；池子详情看 `/stats`）
 - 流式 SSE 透传（自动注入 `include_usage`）；`/stats` 返回当日用量与节点冷却状态
+- 首事件护栏：上游可能先回 200 再在流里报错（配额/限流/节点坏）。首个有效事件之前不给客户端发任何字节，遇到 error 事件或连续无字节超时就**换节点重试**（客户端完全无感）；一旦开始出字就不再重放（已发出的流不可重放）
+- 节点冷却按**连续失败次数指数增长**（30s→60s→120s→240s，上限 8×），成功即清零；只有明确的配额标记才锁到 UTC 零点（普通限流不当配额耗尽）
 - 认证：key 来自 `keys_file`，改文件即生效（热加载）；401 区分「没带 key」与「key 无效」并附 `WWW-Authenticate`
 - 终态错误如实分类：全节点被限流 → 429 `rate_limit_error`；节点故障 / 排队超时 → 503 `server_error`；两者都带 `Retry-After` 退避秒数

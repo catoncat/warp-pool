@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "max_concurrent": 8,          # 并发「建连槽」数(不是并发流数)
     "queue_timeout": 15,          # 排队等建连槽的最长秒数, 超时 503 快速失败
     "ttft_timeout": 25,           # 上游首字节(TTFT)最长等待, 超时换节点
+    "first_event_timeout": 15,    # 首个有效 SSE 事件上限, 超时当节点故障换节点(0=关闭)
     "max_attempts": 15,
     "connect_timeout": 15,
     "read_timeout": 300,
@@ -255,6 +256,7 @@ class NodePool:
         self._unhealthy = set()
         self._sticky = {}  # key -> (port, last_ts)
         self._success = {}    # port -> 当日成功请求数
+        self._fails = {}      # port -> 连续失败次数(短冷却按指数增长, 防坏节点每小时被反复试)
         self._quota_hint = {} # port -> 从 429 学到的配额上限
         self._day = time.strftime("%Y-%m-%d", time.gmtime())  # 启动即当天, 首轮不误清
         self._recycled_mtime = 0.0
@@ -272,6 +274,7 @@ class NodePool:
             return
         with self._lock:
             self._success.clear()
+            self._fails.clear()
             self._quota_hint.clear()
             self._cooldown.clear()
             self._cooldown_daily.clear()
@@ -313,6 +316,7 @@ class NodePool:
                     self._cooldown.pop(p, None)
                     self._cooldown_daily.discard(p)
                     self._success.pop(p, None)
+                    self._fails.pop(p, None)
                     self._quota_hint.pop(p, None)
                     idle.append(self._idle.pop(p, None))
                 for k in [k for k, (p, _) in list(self._sticky.items())
@@ -355,6 +359,7 @@ class NodePool:
     def record_success(self, port: int):
         with self._lock:
             self._success[port] = self._success.get(port, 0) + 1
+            self._fails.pop(port, None)   # 成功即清连续失败计数
         self._write_quota()
 
     def cool_daily(self, port: int, retry_after):
@@ -364,6 +369,7 @@ class NodePool:
         with self._lock:
             self._cooldown[port] = max(self._cooldown.get(port, 0), until)
             self._cooldown_daily.add(port)
+            self._fails.pop(port, None)   # 配额耗尽与"节点坏"是两回事, 不叠加
             # 学习真实配额上限: 撞 429 时的成功数 ≈ 该 IP 日配额
             s = self._success.get(port, 0)
             if s > self._quota_hint.get(port, 0):
@@ -377,10 +383,14 @@ class NodePool:
         self._write_quota()
 
     def cool_short(self, port: int, sec: float = 60):
+        """短冷却。连续失败时按指数增长(上限 8×): 偶发抖动 1×, 真坏节点迅速被动隔离。"""
         idle = None
         with self._lock:
+            n = self._fails.get(port, 0)
+            self._fails[port] = min(n + 1, 8)
+            eff = min(sec * (2 ** min(n, 3)), sec * 8)
             self._cooldown[port] = max(
-                self._cooldown.get(port, 0), time.time() + sec)
+                self._cooldown.get(port, 0), time.time() + eff)
             idle = self._idle.pop(port, None)
         if idle is not None:
             try:
@@ -733,6 +743,27 @@ def upstream_headers(cfg: dict, ses: str | None = None) -> dict:
     return h
 
 
+# 明确的"配额已用尽"标记(小写比对)。上游换措辞时宁可多列几个。
+QUOTA_MARKERS = (
+    b"freeusagelimiterror", b"ratelimitexceeded", b"rate_limit_exceeded",
+    b"insufficient_quota", b"quota_exceeded", b"quota exceeded",
+    b"quota exhausted", b"usage_limit", b"usage limit",
+    b"insufficient balance", b"credit balance is too low",
+    "额度不足".encode(), "配额已用尽".encode(), "已达到使用上限".encode(),
+)
+
+
+def is_quota_error(body: bytes) -> bool:
+    """是否"配额已用尽"(而非普通速率限制/临时错误)。
+
+    只认显式标记: 上游换措辞时判错方向的代价是不对称的 —— 漏判(当短冷却)会让 25 个
+    节点被逐个试到死; 误判(当配额耗尽)会把一堆健康节点白锁到 UTC 零点。所以标记表
+    宁宽(覆盖已知措辞), 但绝不把"看不出原因"的 429 归为配额耗尽。
+    """
+    low = body.lower()
+    return any(m in low for m in QUOTA_MARKERS)
+
+
 def parse_retry_after(body: bytes):
     try:
         msg = json.loads(body)
@@ -798,8 +829,40 @@ def fetch_upstream(cfg: dict, port: int, path: str, payload: bytes,
     return conn, resp, port
 
 
-def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm=None):
-    """SSE 透传 + 从尾部 chunk 抓 usage。"""
+def scan_prelude(buf: bytes):
+    """扫描首个"有效事件"之前已到达的 SSE 数据。
+
+    返回 (state, detail):
+      "error"     → 上游在给出任何正文前就在流里报错(如配额/限流), 换节点重试
+      "effective" → 出现了正文/reasoning/tool_call/finish_reason → 可以提交给客户端
+      "prelude"   → 只有 role/usage 之类的前置帧, 继续憋
+    只解析完整的 "data: " 行; 半行留给下一轮。
+    """
+    for line in buf.split(b"\n"):
+        if not line.startswith(b"data: "):
+            continue
+        data = line[6:].strip()
+        if not data:
+            continue
+        if data == b"[DONE]":
+            return "effective", None      # 极端情况: 空流但正常收尾
+        try:
+            ev = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict) and ev.get("error"):
+            err = ev["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            return "error", msg or "upstream stream error"
+        for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
+            delta = ch.get("delta") or {}
+            if (delta.get("content") or delta.get("reasoning_content")
+                    or delta.get("tool_calls") or ch.get("finish_reason")):
+                return "effective", None
+    return "prelude", None
+
+
+def _send_stream_head(handler, port: int):
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache")
@@ -807,25 +870,62 @@ def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm
     handler.send_header("X-Warp-Pool-Node", str(port))
     handler.end_headers()
     handler.close_connection = True
+
+
+def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm=None) -> bool:
+    """SSE 透传 + 从尾部 chunk 抓 usage。返回 True=已提交给客户端, False=换节点重试。
+
+    首事件护栏: 上游可能先回 200 再在流里报错(配额/限流), 或干脆不出帧。在出现第一个
+    "有效事件"前只憋在内存里、不给客户端发任何字节; 若先到的是 error 事件或首事件超时
+    → 返回 False 交由调用方换节点(重试对客户端完全无感)。一旦提交, 后续失败只能就地
+    透传 —— 已发出去的流不可重放。
+    """
+    first_timeout = float(CFG.get("first_event_timeout", 0) or 0)
+    read_timeout = CFG.get("read_timeout", 300)
+    pending = b""
+    committed = False
+    drained = False
     tail = b""
     usage = None
-    reusable = False
     try:
         while True:
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(first_timeout if (first_timeout > 0 and not committed)
+                                     else read_timeout)
             chunk = resp.read1(16384)
             if not chunk:
+                drained = True
                 break
+            if not committed:
+                pending += chunk
+                state, _detail = scan_prelude(pending)
+                if state == "error":
+                    break                      # 未提交 → 换节点
+                if state != "effective":
+                    continue                   # 只收到前置帧 → 继续憋
+                committed = True               # 提交: 先补发憋住的全部帧
+                _send_stream_head(handler, port)
+                handler.wfile.write(pending)
+                handler.wfile.flush()
+                tail = pending[-8192:]
+                pending = b""
+                continue
             handler.wfile.write(chunk)
             handler.wfile.flush()
             tail = (tail + chunk)[-8192:]
-        reusable = True   # chunked 读到 EOF → body 完整, 连接可复用
-    except (BrokenPipeError, ConnectionResetError, socket.timeout):
-        pass  # 客户端断流或读超时 → 不复用
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # 客户端断流 → 不复用
+    except socket.timeout:
+        pass  # 未提交=等首事件超时(换节点); 已提交=流中途卡住(就地结束)
     finally:
-        if reusable and conn.sock:
+        if getattr(conn, "sock", None) is not None:
+            conn.sock.settimeout(read_timeout)
+        if committed and drained and conn.sock:
             POOL.keep(port, conn)   # 归还池, 下个请求省去 socks+TLS 建连
         else:
             POOL.drop(port, conn)
+    if not committed:
+        return False
     for line in tail.split(b"\n"):
         if line.startswith(b"data: ") and b'"usage"' in line:
             try:
@@ -835,22 +935,38 @@ def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm
     if usagenorm:
         usage = usagenorm(usage)
     USAGE.record(key, model, usage, estimated=usage is None)
+    return True
 
 
-def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagenorm=None):
-    """上游强制流式; 客户端要非流式时, 聚合 SSE chunk 还原成 chat.completion JSON。"""
+def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagenorm=None) -> bool:
+    """上游强制流式; 客户端要非流式时, 聚合 SSE chunk 还原成 chat.completion JSON。
+
+    返回 True=已写出响应, False=首事件前就失败(换节点重试)。
+    """
+    first_timeout = float(CFG.get("first_event_timeout", 0) or 0)
+    read_timeout = CFG.get("read_timeout", 300)
     content_parts = []
     reasoning_parts = []
     tool_calls = {}          # index -> {id, name, arguments}
     finish_reason = None
     usage = None
     reusable = False
+    seen_content = False     # 已拿到正文 → 之后的 error 不再当节点故障
+    bail = False
+    buf = b""
     try:
         while True:
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(first_timeout if (first_timeout > 0 and not seen_content)
+                                     else read_timeout)
             chunk = resp.read1(16384)
             if not chunk:
+                reusable = True
                 break
-            for line in chunk.split(b"\n"):
+            buf += chunk
+            lines = buf.split(b"\n")
+            buf = lines.pop()   # 末尾可能是半行, 留下一轮再拼
+            for line in lines:
                 if not line.startswith(b"data: "):
                     continue
                 data = line[6:].strip()
@@ -860,6 +976,11 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
                     ev = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(ev, dict) and ev.get("error") and not seen_content:
+                    print("[first-event] error event before content: node=%d %s"
+                          % (port, str(ev["error"])[:200]), flush=True)
+                    bail = True
+                    break
                 usage = ev.get("usage") or usage
                 for ch in ev.get("choices") or []:
                     finish_reason = ch.get("finish_reason") or finish_reason
@@ -879,10 +1000,22 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
                             slot["name"] = fn["name"]
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"]
-        reusable = True
+                    if (delta.get("content") or delta.get("reasoning_content")
+                            or delta.get("tool_calls") or ch.get("finish_reason")):
+                        seen_content = True
+            if bail:
+                break
     except (BrokenPipeError, ConnectionResetError, socket.timeout):
-        pass
+        bail = not seen_content   # 等首个有效事件时超时 → 当节点故障重试
     finally:
+        if getattr(conn, "sock", None) is not None:
+            conn.sock.settimeout(read_timeout)
+        if reusable and conn.sock:
+            POOL.keep(port, conn)
+        else:
+            POOL.drop(port, conn)
+    if bail or not seen_content:
+        return False    # 一个字都没产出 → 换节点重试(客户端还没收到任何东西)
         if reusable and conn.sock:
             POOL.keep(port, conn)
         else:
@@ -914,6 +1047,7 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
     handler.send_header("X-Warp-Pool-Node", str(port))
     handler.end_headers()
     handler.wfile.write(body)
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1150,8 +1284,8 @@ class Handler(BaseHTTPRequestHandler):
                     body = resp.read()
                     POOL.drop(port, conn)
                     ra = parse_retry_after(body)
-                    # zen 日配额限流(FreeUsageLimitError): 该 IP 当天废了 → 冷却到 UTC 零点
-                    if b"FreeUsageLimitError" in body or b"rateLimitExceeded" in body:
+                    # 日配额限流: 该 IP 当天废了 → 冷却到 UTC 零点
+                    if is_quota_error(body):
                         POOL.cool_daily(port, ra)
                         retry_after = max(retry_after,
                                           int(ra) if ra else int(utc_midnight_ts() - time.time()))
@@ -1179,10 +1313,10 @@ class Handler(BaseHTTPRequestHandler):
                 SEM.release()
                 released = True
                 if aggregate:
-                    relay_aggregate(self, conn, resp, key, model, port, usagenorm)
+                    ok = relay_aggregate(self, conn, resp, key, model, port, usagenorm)
                 elif stream or resp.headers.get("Content-Type", "").startswith(
                         "text/event-stream"):
-                    relay_stream(self, conn, resp, key, model, port, usagenorm)
+                    ok = relay_stream(self, conn, resp, key, model, port, usagenorm)
                 else:
                     body = resp.read()   # 完整读完 → 归还池复用
                     POOL.keep(port, conn)
@@ -1194,7 +1328,16 @@ class Handler(BaseHTTPRequestHandler):
                         usage = usagenorm(usage)
                     USAGE.record(key, model, usage, estimated=usage is None)
                     self._relay_raw(200, body, node=port)
-                return
+                    return
+                if ok:
+                    return
+                # 首事件前就失败(流内 error 事件/首事件超时/空流): 客户端一个字节都没收到
+                # → 当该节点故障换下一个。注: 上面的 record_success 已经记过这次成功,
+                # 会轻微高估该节点用量(宁可高估把节点提前轮换, 也不漏记)。
+                POOL.drop(port, conn)
+                POOL.cool_short(port, 20)
+                last_status, last_body = 502, b"upstream produced no output before first event"
+                continue
             finally:
                 if not released:
                     SEM.release()

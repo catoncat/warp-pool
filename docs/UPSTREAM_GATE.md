@@ -49,12 +49,24 @@ ses_ + 12位hex( ~(ts_ms * 4096 + counter) 的低 48 位 ) + 14位base62
 - 上游对**已登录**用户也存在随机误判（相似形态的请求被拒），说明它是启发式而非精确校验 —— 换个方向理解：被判定的条件就藏在这些启发式里。
 - 失效时的复现路径：按上面"逆向方法"重抓一次，重新二分。
 
+## 上游流的两条实测特性（决定网关重试策略）
+
+在网关侧连续抓了几十条上游 SSE 流：
+
+1. **思考期间有 keepalive**：上游先回 200 头，然后在模型思考期间每 ~4-5s 发一条 SSE 注释帧 `: keep-alive`，再才开始出正文。实测最长的"响应头→首个 data 帧"间隔 **54s**（期间 keepalive 不断），所以不能用"多久没出正文"判故障 —— 只能用"连续多久没收到任何字节"。
+2. **错误可以发生在 200 之后**：配额/限流/节点故障都可能先给 200 再在流里发 `data: {"error": ...}`。此时客户端（尤其非流式聚合路径）会拿到一个空回复。
+
+网关的两道应对：
+
+- `first_event_timeout`（默认 15s，覆盖 3 次 keepalive 间隔）只统计"连续无字节"，超时视为节点挂死；
+- **首事件护栏**：首个有效事件（正文 / reasoning / tool_call / finish_reason）之前先攒着不发给客户端，遇 error 事件或超时则直接换节点重试（客户端无感）；已开始出字后不再重放。
+
 ## 网关侧对应实现
 
 | 条件 | 网关实现 |
 |---|---|
 | 1 携带 `Bearer public` | `upstream_headers()` |
-| 2 近期版本 UA | `cfg["0penc0de_version"]` 默认近期版本号 |
+| 2 近期版本 UA | `cfg["opencode_version"]` 默认近期版本号 |
 | 3 合法 descending session | `make_session_id()` / `session_for_fp()`（同对话复用） |
 | 4 强制流式 | `do_POST` 置 `stream=True`；客户端要非流式时由 `relay_aggregate()` 聚合 SSE 还原 |
 | 5 注入 `read` 工具 | `inject_gate_tools()` |
