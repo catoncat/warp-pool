@@ -5,7 +5,7 @@
 ## 一键运行
 
 ```bash
-python3 gateway/tests/run_tests.py             # 单元 51 + 集成 8（默认）
+python3 gateway/tests/run_tests.py             # 单元 52 + 集成 8（默认）
 python3 gateway/tests/run_tests.py --bench     # 单元 + 集成 + 基准
 python3 gateway/tests/run_tests.py --no-live   # 只跑单元（无网络环境）
 python3 gateway/tests/run_tests.py --bench-only
@@ -13,7 +13,7 @@ python3 gateway/tests/run_tests.py --bench-only
 
 退出码 0 = 全过；1 = 有失败。
 
-## 单元测试（`test_nodepool.py` + `test_http_ux.py` + `test_relay.py`，51 项，无网络）
+## 单元测试（`test_nodepool.py` + `test_http_ux.py` + `test_relay.py`，52 项，无网络）
 
 | 组 | 覆盖 |
 |---|---|
@@ -21,7 +21,7 @@ python3 gateway/tests/run_tests.py --bench-only
 | NodePool | pick/空池、同对话粘性、多对话分散、配额将尽轮换、429 学习配额、冷却跳过、recycled 清态、LRU 有界、池枯竭兜底 |
 | 连接池 | keep/borrow、重复 keep 关旧连接、drop、cool/recycled 清 idle |
 | HTTP 边界 | 401 区分缺 key/无效 key + `WWW-Authenticate`、Bearer 大小写、`x-api-key`、空体/缺 CL/非法 CL/超大请求体、终态 429/503 分类 + `Retry-After` |
-| 首事件护栏 | 首个正文前提交、流内 error 前置→不提交、前置帧后 error→不提交、空流→不提交、连续无字节超时→不提交、提交后中断→保留已发内容、提交后超时预算切回 `read_timeout`、关闭护栏即时提交；非流式聚合：正常流还原 JSON、error/空流/超时重试、出字后 error 保留答案、**TCP 分段切断的一行能拼回来** |
+| 首事件护栏 | 首个正文前提交、流内 error 前置→不提交、前置帧后 error→不提交、空流→不提交、连续无字节超时→不提交、提交后中断→保留已发内容、提交后超时预算切回 `read_timeout`、关闭护栏即时提交；非流式聚合：正常流还原 JSON、error/空流/超时重试、出字后 error 保留答案、上游正常收尾但空回复→不重试、**TCP 分段切断的一行能拼回来** |
 | 配额标记 / 冷却 | `FreeUsageLimitError`/`rateLimitExceeded`/`insufficient_quota`/中英文配额文案→真配额；普通 `slow down`/`too many requests`→不算；冷却 30→60→120→240 封顶 8×，成功与日冷却都清零连续失败计数 |
 
 每个测试独立 NodePool（`setUp` 重建，环境变量 `WARP_POOL_STATE`/`WARP_GATEWAY_CONFIG` 指向临时目录），杜绝跨测试状态污染。
@@ -29,6 +29,7 @@ python3 gateway/tests/run_tests.py --bench-only
 ## 集成测试（`test_live.py`，8 项，真实网关）
 
 默认 `http://127.0.0.1:10900`（生产隧道）；`--gateway`/`--key` 可覆盖。
+模型 id 从 `GET /v1/models` 挑（首选列表见 `test_live.py`），不硬编码 —— 上游改过名，硬编码会让整轮集成测试假失败。
 
 1. `GET /healthz` → 200 ok
 2. 无 key `/stats`、`/chat/completions` → 401

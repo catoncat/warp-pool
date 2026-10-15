@@ -16,6 +16,10 @@ import urllib.error
 import urllib.request
 
 DEFAULT_GATEWAY = "http://127.0.0.1:10900"
+# 模型 id 会随上游改名/下架而变(曾因硬编码导致整轮集成测试误报), 所以从 /v1/models 挑;
+# 首选列表只影响"优先用哪个", 不在列表里就用可用的第一个
+PREFERRED_MODELS = ("deepseek-v4.1-flash-free", "mimo-v2.6-flash-free")
+FALLBACK_MODEL = PREFERRED_MODELS[0]
 
 def default_key():
     # key 来源: 环境变量 WARP_TEST_KEY, 或部署时回传的 exports/gateway-key.txt
@@ -33,6 +37,7 @@ class LiveGateway:
         self.gw = gw.rstrip("/")
         self.key = key
         self.base = self.gw + "/v1"
+        self._model = None
 
     def _do(self, url, method, body=None, headers=None, timeout=180):
         h = {"Content-Type": "application/json"}
@@ -55,9 +60,23 @@ class LiveGateway:
         """网关根路径(healthz/stats 不走 /v1)。"""
         return self._do(self.gw + path, method, body, headers, timeout)
 
+    def model(self):
+        """可用模型 id(懒发现一次)。"""
+        if self._model is None:
+            ids = []
+            try:
+                status, h, b = self.req_raw("GET", "/v1/models", None, timeout=10)
+                if status == 200:
+                    ids = [m.get("id", "") for m in json.loads(b).get("data", [])]
+            except Exception:
+                pass
+            self._model = next((m for m in PREFERRED_MODELS if m in ids),
+                               ids[0] if ids else FALLBACK_MODEL)
+        return self._model
+
     def chat(self, messages, stream=False, max_tokens=32, timeout=180):
         return self.req("POST", "/chat/completions", {
-            "model": "deepseek-v4-flash-free",
+            "model": self.model(),
             "stream": stream, "max_tokens": max_tokens, "messages": messages,
         }, timeout=timeout)
 
@@ -128,8 +147,17 @@ def main():
     except urllib.error.HTTPError as e:
         status = e.code
     check("无 key → 401", status == 401, str(status))
-    status, h, b = g.req("POST", "/chat/completions", {"model": "x"}, timeout=10)
+    # 裸 POST 不带 Authorization(不能借 g.req, 它会自动带上 key)
+    try:
+        r = urllib.request.Request(g.base + "/chat/completions",
+                                   data=json.dumps({"model": g.model()}).encode(),
+                                   headers={"Content-Type": "application/json"}, method="POST")
+        resp = urllib.request.urlopen(r, timeout=10)
+        status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
     check("无 key chat → 401", status == 401, str(status))
+    print("  (模型: %s)" % g.model())
 
     # 3) 非流式
     status, h, b = g.chat([{"role": "user", "content": "用一句话说你好"}], stream=False)

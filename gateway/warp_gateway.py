@@ -952,6 +952,7 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
     usage = None
     reusable = False
     seen_content = False     # 已拿到正文 → 之后的 error 不再当节点故障
+    done_seen = False        # 上游干净收尾: 即使一个字都没出, 也算"正常但空"的回复
     bail = False
     buf = b""
     try:
@@ -971,6 +972,7 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
                     continue
                 data = line[6:].strip()
                 if data == b"[DONE]":
+                    done_seen = True
                     continue
                 try:
                     ev = json.loads(data)
@@ -1014,8 +1016,8 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
             POOL.keep(port, conn)
         else:
             POOL.drop(port, conn)
-    if bail or not seen_content:
-        return False    # 一个字都没产出 → 换节点重试(客户端还没收到任何东西)
+    if bail or not (seen_content or done_seen):
+        return False    # 一个字都没产出且上游没收尾 → 换节点重试(客户端还没收到任何东西)
         if reusable and conn.sock:
             POOL.keep(port, conn)
         else:

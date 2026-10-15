@@ -227,6 +227,15 @@ class TestAggregateGuard(RelayBase):
         body = json.loads(h.body().split(b"--head--\n", 1)[1])
         self.assertEqual(body["choices"][0]["message"]["content"], "hi")
 
+    def test_clean_but_empty_stream_is_returned(self):
+        # 上游正常收尾但没出正文: 这是"空回复"而不是节点故障, 不要重试(重试会白烧配额,
+        # 且与流式路径行为不一致 —— 流式会把空回复交给客户端)
+        empty = sse({}, b"[DONE]")
+        ok, h, _ = self.run_aggregate([empty])
+        self.assertTrue(ok)
+        body = json.loads(h.body().split(b"--head--\n", 1)[1])
+        self.assertEqual((body["choices"][0]["message"].get("content") or ""), "")
+
     def test_line_split_across_chunks_is_joined(self):
         # 回归: 旧实现按 chunk 切行, TCP 分段切开的一行会被整条丢掉
         full = PRELUDE + CONTENT + FINISH
