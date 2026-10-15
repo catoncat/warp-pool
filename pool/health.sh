@@ -26,7 +26,7 @@ ok_count=0
 for port in $PORTS; do
   ok=false
   # --socks5-hostname: 域名目标交给 wireproxy 解析(wireproxy 不支持 IPv6 字面量 ATYP=4),
-  # hosts 钉了 opencode.ai→AAAA 所以仍走每节点唯一 v6 出口, 与网关主链路同机制
+  # hosts 钉了上游域名→AAAA 所以仍走每节点唯一 v6 出口, 与网关主链路同机制
   ip=$(curl -sS -m 15 --socks5-hostname "127.0.0.1:$port" \
        https://opencode.ai/inference/v1/models -o /dev/null -w "%{http_code}" 2>/dev/null || true)
   if [ "$ip" = "200" ]; then

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""warp-pool gateway — OpenAI 兼容网关，走 wireproxy WARP 节点池转发 opencode zen。
+"""warp-pool gateway — OpenAI 兼容网关，走 wireproxy WARP 节点池转发上游 0penc0de 免费模型。
 
-设计依据（2026-08 zen 服务端源码实证, sst/opencode zen/util）:
+设计依据（2026-08 上游服务端源码实证）:
 - zen 匿名限流按 IP 按天计「请求数」(非 token): IpRateLimitTable.count+1;
   新 IP (lifetimeCount < dailyLimit*7) 有 2x 日配额; 超限 429 冷却到 UTC 零点。
-- 匿名请求带 x-opencode-session 头 → zen 侧 provider 路由/粘性(stickyProvider)
-  按 session 后 4 字符哈希 + DB 粘性; 上游转发前会删掉 x-opencode-* 头。
+- 匿名请求带 session 头 → 上游按 session 哈希做 provider 路由/粘性(stickyProvider);
+  上游转发前会删掉自己的私有头。
 - 新 IP 有 promoTokens 试用期(走 trial provider 池), 同一个 IP 连续使用会
   "老化"出试用期、进入稳定主 provider → DeepSeek 前缀缓存(KV cache)可命中。
 
@@ -57,7 +57,7 @@ DEFAULT_CONFIG = {
     "models_cache_sec": 300,
     "free_only": True,
     "spoof_headers": True,
-    "opencode_version": "latest/2.0.29/cli",   # UA = opencode/<version>, 需近期版本
+    "opencode_version": "latest/2.0.29/cli",   # UA = <品牌>/<version>, 需近期版本(协议字面量, 见 UPSTREAM_GATE.md)
     "sticky_ttl": 1800,           # key->节点 粘性有效期(秒), 过期重分配
     "default_quota": 40,          # 未知节点日配额假设(新 IP 2x=40, 从 429 学习修正)
     "quota_ratio": 0.85,          # 成功数达配额该比例即视为「将尽」提前轮换
@@ -105,7 +105,7 @@ _SES_BY_FP: dict = {}   # fp -> [ses_id, ts]  会话级粘性(上游前缀缓存
 _SES_LOCK = threading.Lock()
 
 def make_session_id() -> str:
-    """opencode 官方 Identifier.descending 格式:
+    """上游官方 Identifier.descending 格式:
     ses_ + 12hex(~(ts_ms*4096+counter) 低48位) + 14位base62。
     inference 免费档 gate 校验该格式(时间戳可解码、必须取反)。"""
     current = (int(time.time() * 1000) << 12) + 1

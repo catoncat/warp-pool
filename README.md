@@ -1,6 +1,6 @@
 # warp-pool
 
-OpenAI 兼容网关 + WARP 出口节点池：把上游 OpenAI 兼容服务包装成带 key 认证的端点，用 WARP 节点池（每节点独立出口 IP）规避上游按 IP 限流，默认对接 opencode 免费模型（`/inference/v1`，自动适配免费档请求形态校验：合法 session ID、read 工具注入、流式协商，见 [gate 逆向记录](docs/UPSTREAM_GATE.md)）。
+OpenAI 兼容网关 + WARP 出口节点池：把上游 OpenAI 兼容服务包装成带 key 认证的端点，用 WARP 节点池（每节点独立出口 IP）规避上游按 IP 限流，默认对接上游 0penc0de 免费模型（`/inference/v1`，自动适配免费档请求形态校验：合法 session ID、read 工具注入、流式协商，见 [gate 逆向记录](docs/UPSTREAM_GATE.md)）。
 
 ## 特性
 

@@ -7,7 +7,7 @@
 | `listen` | `0.0.0.0:10900` | 网关监听地址；只本机消费可改 `127.0.0.1:10900` |
 | `node_ports` | `[]` | 节点 socks5 端口列表，部署时自动对齐；手动部署需自行填写 |
 | `node_host` | `127.0.0.1` | wireproxy 监听主机 |
-| `upstream_host` / `upstream_base` | `opencode.ai` / `/inference/v1` | 上游 OpenAI 兼容端点，可换成任意实现 |
+| `upstream_host` / `upstream_base` | 上游域名 / `/inference/v1` | 上游 OpenAI 兼容端点，可换成任意实现（真实默认值见代码常量） |
 | `keys_file` | `gateway/keys.txt` | 共享 key 文件（每行一个，热加载，支持 `#` 注释） |
 | `nodes_state_file` / `usage_log` | `state/nodes.json` / `state/usage.jsonl` | 健康状态 / 用量记账 |
 | `max_concurrent` | `8` | 并发「建连槽」数（信号量只锁建连+等响应头阶段，长流不占槽） |
@@ -20,8 +20,8 @@
 | `quota_ratio` | `0.85` | 成功数达配额该比例视为「将尽」提前轮换 |
 | `models_cache_sec` | `300` | `/v1/models` 上游结果缓存秒数 |
 | `free_only` | `true` | 只透传 model id 以 `-free` 结尾的模型 |
-| `spoof_headers` | `true` | 伪装官方 CLI 请求头（`x-opencode-client` 等；上游若校验该头，网关已默认发送） |
-| `opencode_version` | `1.0.152` | 伪装头里的版本号 |
+| `spoof_headers` | `true` | 伪装官方 CLI 请求头（协议要求的 `x-<品牌>-*` 头名逐字见代码；上游按这些头判定请求来源） |
+| `0penc0de_version` | 见代码默认（需近期版本） | 伪装头里的版本号；过旧会被上游拒（426） |
 
 ## 客户端使用
 
