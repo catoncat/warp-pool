@@ -15,6 +15,7 @@
 | `ttft_timeout` | `25` | 上游首字节（TTFT）最长等待，超时换节点 |
 | `max_attempts` | `15` | 单请求最多尝试节点数（换节点重试） |
 | `connect_timeout` / `read_timeout` | `15` / `300` | 连接 / 流式读超时 |
+| `max_body_bytes` | `64MB` | 请求体上限，超过返回 413（防超大 Content-Length 拖住线程） |
 | `conv_table_size` | `256` | 会话指纹表上限（LRU，超限淘汰最久未用对话的粘性） |
 | `default_quota` | `20` | 未知节点日配额假设（从实际 429 学习修正） |
 | `quota_ratio` | `0.85` | 成功数达配额该比例视为「将尽」提前轮换 |
@@ -34,7 +35,9 @@ curl -H "Authorization: Bearer $KEY" https://your.domain/v1/chat/completions \
 
 网关是标准 OpenAI 兼容端点：
 
-- `GET /v1/models`、`POST /v1/chat/completions` 需 `Authorization: Bearer <key>` 或 `x-api-key`；其余路径 404
-- `GET /healthz` 无鉴权健康检查
+- `GET /v1/models`、`POST /v1/chat/completions` / `/v1/responses` 需 `Authorization: Bearer <key>` 或 `x-api-key`（`Bearer` 大小写不敏感）；其余路径 404
+- 请求体：缺 `Content-Length` / 空体 / CL 非法 → 400；超过 `max_body_bytes` → 413
+- `GET /healthz` 无鉴权健康检查（进程活着即 200；池子详情看 `/stats`）
 - 流式 SSE 透传（自动注入 `include_usage`）；`/stats` 返回当日用量与节点冷却状态
-- 认证：key 来自 `keys_file`，改文件即生效（热加载）；无 key 一律 401
+- 认证：key 来自 `keys_file`，改文件即生效（热加载）；401 区分「没带 key」与「key 无效」并附 `WWW-Authenticate`
+- 终态错误如实分类：全节点被限流 → 429 `rate_limit_error`；节点故障 / 排队超时 → 503 `server_error`；两者都带 `Retry-After` 退避秒数

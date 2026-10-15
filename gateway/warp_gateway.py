@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "max_attempts": 15,
     "connect_timeout": 15,
     "read_timeout": 300,
+    "max_body_bytes": 64 * 1024 * 1024,   # 请求体上限, 防超大 Content-Length 拖住线程
     "models_cache_sec": 300,
     "free_only": True,
     "spoof_headers": True,
@@ -923,21 +924,35 @@ class Handler(BaseHTTPRequestHandler):
         pass  # journald 噪音控制; 关键事件显式 log
 
     def _auth_key(self):
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return auth[7:]
+        # Bearer 大小写不敏感(RFC 6750: scheme 大小写不敏感)
+        parts = self.headers.get("Authorization", "").split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
         return self.headers.get("x-api-key")
 
-    def _json(self, status: int, obj: dict):
+    def _json(self, status: int, obj: dict, headers: dict | None = None):
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def _err(self, status: int, msg: str, typ="rate_limit_error"):
-        self._json(status, {"error": {"message": msg, "type": typ}})
+    def _err(self, status: int, msg: str, typ="rate_limit_error",
+             headers: dict | None = None):
+        self._json(status, {"error": {"message": msg, "type": typ}}, headers=headers)
+
+    def _auth_error(self):
+        """401: 区分「没带 key」与「key 无效」(排障时一眼知道是哪种),
+        并附 WWW-Authenticate: 标准客户端收到 401 后会据此重新协商凭据。"""
+        if not (self.headers.get("Authorization") or self.headers.get("x-api-key")):
+            msg = "missing api key (send 'Authorization: Bearer <key>' or 'x-api-key')"
+        else:
+            msg = "invalid api key"
+        self._json(401, {"error": {"message": msg, "type": "auth_error"}},
+                   headers={"WWW-Authenticate": 'Bearer realm="warp-pool"'})
 
     # ---- GET ----
     def do_GET(self):
@@ -946,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         key = self._auth_key()
         if not key or not KEYS.valid(key):
-            self._err(401, "invalid api key", "auth_error")
+            self._auth_error()
             return
         if self.path == "/v1/models":
             self._handle_models()
@@ -999,13 +1014,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         key = self._auth_key()
         if not key or not KEYS.valid(key):
-            self._err(401, "invalid api key", "auth_error")
+            self._auth_error()
             return
         if self.path not in ("/v1/chat/completions", "/v1/responses"):
             self._err(404, "not found", "not_found")
             return
         is_responses = self.path == "/v1/responses"
-        length = int(self.headers.get("Content-Length", 0))
+        # 请求体边界: 缺 CL / 空体 / CL 非法 / 超限都明确报错, 不把线程吊在读上
+        max_body = int(CFG.get("max_body_bytes", 64 * 1024 * 1024))
+        try:
+            length = int(self.headers.get("Content-Length", -1))
+        except ValueError:
+            self._err(400, "invalid Content-Length", "invalid_request")
+            return
+        if length < 0:
+            self._err(400, "missing request body (set Content-Length)", "invalid_request")
+            return
+        if length == 0:
+            self._err(400, "empty request body", "invalid_request")
+            return
+        if length > max_body:
+            self._err(413, "request body too large (max %d bytes)" % max_body,
+                      "invalid_request")
+            return
         payload = self.rfile.read(length)
         try:
             req = json.loads(payload)
@@ -1080,6 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
         tried = set()
         t_req = time.time()  # TTFT 计时: 从网关收到完整请求到上游响应头
         last_status, last_body = 502, b"no node available"
+        retry_after = 30  # 终态错误时以 Retry-After 头告知客户端退避秒数
         ses = session_for_fp(fp)   # 同对话同 session → 上游前缀缓存命中
         for _ in range(CFG["max_attempts"]):
             port = POOL.pick(key, fp=fp, exclude=tried)
@@ -1089,6 +1121,7 @@ class Handler(BaseHTTPRequestHandler):
             acquired = SEM.acquire(timeout=CFG.get("queue_timeout", 15))
             if not acquired:
                 last_status, last_body = 503, b"gateway busy: queue timeout"
+                retry_after = max(retry_after, 2)
                 break
             released = False
             try:
@@ -1116,12 +1149,15 @@ class Handler(BaseHTTPRequestHandler):
                 if resp.status == 429:
                     body = resp.read()
                     POOL.drop(port, conn)
+                    ra = parse_retry_after(body)
                     # zen 日配额限流(FreeUsageLimitError): 该 IP 当天废了 → 冷却到 UTC 零点
                     if b"FreeUsageLimitError" in body or b"rateLimitExceeded" in body:
-                        POOL.cool_daily(port, parse_retry_after(body))
+                        POOL.cool_daily(port, ra)
+                        retry_after = max(retry_after,
+                                          int(ra) if ra else int(utc_midnight_ts() - time.time()))
                     else:
-                        ra = parse_retry_after(body)
                         POOL.cool_short(port, ra if ra else 60)
+                        retry_after = max(retry_after, int(ra) if ra else 60)
                     last_status, last_body = 429, body
                     continue  # 立即换下一节点重试(成本 ~0.1s)
                 if resp.status >= 500:
@@ -1162,13 +1198,30 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 if not released:
                     SEM.release()
-        status = last_status if last_status in (429,) else 503
+        # 全节点尝试完: 按真实失败类别报终态(旧实现一律报 rate_limit "pool exhausted",
+        # 客户端分不清"被限流"还是"节点故障", 也没有退避提示 → 高并发下风暴式重试)
+        if last_status == 429:
+            try:
+                msg = json.loads(last_body)
+                if not isinstance(msg, dict) or "error" not in msg:
+                    raise ValueError
+            except (json.JSONDecodeError, TypeError, ValueError):
+                msg = {"error": {"message": "upstream rate limited, pool exhausted",
+                                 "type": "rate_limit_error"}}
+            self._json(429, msg, headers={"Retry-After": str(max(1, retry_after))})
+            return
         try:
-            msg = json.loads(last_body)
+            parsed = json.loads(last_body)
+            if isinstance(parsed, dict) and "error" in parsed:
+                self._json(503, parsed, headers={"Retry-After": str(max(1, retry_after))})
+                return
         except (json.JSONDecodeError, TypeError):
-            msg = {"error": {"message": "upstream rate limited, pool exhausted",
-                             "type": "rate_limit_error"}}
-        self._json(status, msg)
+            pass
+        text = last_body.decode("utf-8", "replace").strip() if last_body else ""
+        if not text:
+            text = "no healthy upstream node available, retry later"
+        self._json(503, {"error": {"message": text, "type": "server_error"}},
+                   headers={"Retry-After": str(max(1, retry_after))})
 
     def _relay_raw(self, status: int, body: bytes, node: int | None = None):
         self.send_response(status)

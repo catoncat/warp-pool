@@ -27,7 +27,8 @@ cd /opt/warp-pool
 # wireproxy 二进制（GitHub release, 静态）
 if [ ! -x bin/wireproxy ]; then
   mkdir -p bin
-  curl -sSL -m 120 -o /tmp/wireproxy.tgz \
+  # -f: HTTP 错误(403/404/限流)时立即失败, 否则错误页会被存成 tgz 到 tar 才报错
+  curl -sSL -f -m 120 -o /tmp/wireproxy.tgz \
     "$GH_BASE/octeep/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz"
   tar xzf /tmp/wireproxy.tgz -C bin && rm -f /tmp/wireproxy.tgz
 fi

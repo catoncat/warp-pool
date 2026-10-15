@@ -13,13 +13,14 @@ python3 gateway/tests/run_tests.py --bench-only
 
 退出码 0 = 全过；1 = 有失败。
 
-## 单元测试（`test_nodepool.py`，18 项，无网络）
+## 单元测试（`test_nodepool.py` + `test_http_ux.py`，无网络）
 
 | 组 | 覆盖 |
 |---|---|
 | 会话指纹 | 同对话指纹稳定（历史追加不影响）、不同对话区分、多模态 content |
 | NodePool | pick/空池、同对话粘性、多对话分散、配额将尽轮换、429 学习配额、冷却跳过、recycled 清态、LRU 有界、池枯竭兜底 |
 | 连接池 | keep/borrow、重复 keep 关旧连接、drop、cool/recycled 清 idle |
+| HTTP 边界 | 401 区分缺 key/无效 key + `WWW-Authenticate`、Bearer 大小写、`x-api-key`、空体/缺 CL/非法 CL/超大请求体、终态 429/503 分类 + `Retry-After` |
 
 每个测试独立 NodePool（`setUp` 重建，环境变量 `WARP_POOL_STATE`/`WARP_GATEWAY_CONFIG` 指向临时目录），杜绝跨测试状态污染。
 

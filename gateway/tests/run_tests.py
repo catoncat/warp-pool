@@ -33,7 +33,7 @@ def main():
     rc = 0
     if not args.bench_only:
         rc |= run([sys.executable, "-m", "unittest", "discover", "-s", "gateway/tests",
-                   "-p", "test_nodepool.py"], "单元测试(NodePool/连接池/指纹)")
+                   "-p", "test_*.py"], "单元测试(NodePool/连接池/指纹/HTTP 边界)")
         if not args.no_live:
             cmd = [sys.executable, "gateway/tests/test_live.py", "--gateway", args.gateway]
             if args.key:
