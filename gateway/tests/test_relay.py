@@ -134,14 +134,14 @@ class RelayBase(unittest.TestCase):
         wg.USAGE = StubUsage()
         wg.POOL = wg.NodePool(self.cfg)
 
-    def run_stream(self, chunks, exc=None):
+    def run_stream(self, chunks, exc=None, fmt="chat"):
         h, c = FakeHandler(), FakeConn()
-        ok = self.wg.relay_stream(h, c, FakeResp(chunks, exc), "k", "m", 10800)
+        ok = self.wg.relay_stream(h, c, FakeResp(chunks, exc), "k", "m", 10800, fmt=fmt)
         return ok, h, c
 
-    def run_aggregate(self, chunks, exc=None):
+    def run_aggregate(self, chunks, exc=None, fmt="chat"):
         h, c = FakeHandler(), FakeConn()
-        ok = self.wg.relay_aggregate(h, c, FakeResp(chunks, exc), "k", "m", 10800)
+        ok = self.wg.relay_aggregate(h, c, FakeResp(chunks, exc), "k", "m", 10800, fmt=fmt)
         return ok, h, c
 
 
@@ -244,6 +244,85 @@ class TestAggregateGuard(RelayBase):
         self.assertTrue(ok)
         body = json.loads(h.body().split(b"--head--\n", 1)[1])
         self.assertEqual(body["choices"][0]["message"]["content"], "hi")
+
+
+def rsse(ev_type, obj=None):
+    """responses 协议的 SSE 帧: 事件名与 data.type 同名, 且 data 里是完整对象。"""
+    o = {"type": ev_type, "sequence_number": 0}
+    o.update(obj or {})
+    return b"event: " + ev_type.encode() + b"\ndata: " + json.dumps(o).encode() + b"\n\n"
+
+
+R_PRELUDE = (rsse("response.created", {"response": {"id": "resp_1", "status": "in_progress"}})
+             + rsse("response.in_progress", {"response": {"id": "resp_1"}})
+             + rsse("response.output_item.added", {"output_index": 0, "item": {"type": "reasoning"}}))
+R_DELTA = rsse("response.output_text.delta", {"output_index": 0, "delta": "hi"})
+R_FINAL = rsse("response.completed", {"response": {
+    "id": "resp_1", "object": "response", "status": "completed", "model": "muse-x",
+    "output": [{"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]}],
+    "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}}})
+R_FAILED = rsse("response.failed", {"response": {"id": "resp_1", "status": "failed",
+                                                "error": {"code": "x", "message": "boom"}}})
+
+
+class TestResponsesProtocol(RelayBase):
+    """responses 协议: 只吃 /responses 的模型(如 muse)经网关闭环。
+
+    动手理由: 前导帧(created/in_progress/output_item.added)不带内容, 若当成"有效
+    事件"会过早提交 —— 上游随后报错就已发给客户端; 反之若丢掉真正的有效信号
+    (delta/终态), 整个 responses 路径会 100% 超时换节点(这正是 muse 报 503 的原因)。
+    """
+
+    def test_prelude_frames_are_not_effective(self):
+        state, _ = self.wg.scan_prelude(R_PRELUDE, "responses")
+        self.assertEqual(state, "prelude")
+
+    def test_delta_and_final_are_effective(self):
+        self.assertEqual(self.wg.scan_prelude(R_DELTA, "responses")[0], "effective")
+        self.assertEqual(self.wg.scan_prelude(R_FINAL, "responses")[0], "effective")
+
+    def test_failed_event_is_error(self):
+        state, detail = self.wg.scan_prelude(R_FAILED, "responses")
+        self.assertEqual(state, "error")
+        self.assertEqual(detail, "boom")
+
+    def test_stream_commits_on_delta_and_replays_prelude(self):
+        ok, h, _ = self.run_stream([R_PRELUDE + R_DELTA, R_FINAL], fmt="responses")
+        self.assertTrue(ok)
+        self.assertEqual(h.status, 200)
+        self.assertIn(b"response.created", h.body())     # 前置帧补发
+        self.assertIn(b"output_text.delta", h.body())
+
+    def test_stream_timeout_before_delta_does_not_commit(self):
+        ok, h, _ = self.run_stream([R_PRELUDE], exc=self.socket.timeout("stall"), fmt="responses")
+        self.assertFalse(ok)
+        self.assertIsNone(h.status)                      # 客户端一个字节都没收到
+
+    def test_stream_failed_before_delta_does_not_commit(self):
+        ok, h, _ = self.run_stream([R_PRELUDE, R_FAILED], fmt="responses")
+        self.assertFalse(ok)
+        self.assertIsNone(h.status)
+
+    def test_aggregate_passes_through_upstream_response_object(self):
+        ok, h, _ = self.run_aggregate([R_PRELUDE + R_DELTA + R_FINAL], fmt="responses")
+        self.assertTrue(ok)
+        body = json.loads(h.body().split(b"--head--\n", 1)[1])
+        self.assertEqual(body["object"], "response")      # responses 格式, 不是 chat.completion
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["usage"]["total_tokens"], 7)
+        self.assertEqual(body["output"][0]["content"][0]["text"], "hi")
+
+    def test_aggregate_without_final_event_retries(self):
+        # 流被截断(只有前导帧, 没有终态) → 换节点, 不能让客户端拿到半截对象
+        ok, h, _ = self.run_aggregate([R_PRELUDE], fmt="responses")
+        self.assertFalse(ok)
+        self.assertEqual(h.body(), b"")
+
+    def test_aggregate_failed_retries(self):
+        ok, h, _ = self.run_aggregate([R_FAILED], fmt="responses")
+        self.assertFalse(ok)
+        self.assertEqual(h.body(), b"")
 
 
 class TestQuotaMarkers(RelayBase):

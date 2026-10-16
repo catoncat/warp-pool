@@ -34,6 +34,7 @@ def make_env():
         "sticky_ttl": 1800, "free_only": True, "spoof_headers": True,
         "opencode_version": "latest/2.0.29/cli",
         "max_body_bytes": 1024,
+        "model_blacklist": ["jev-1.13-free"],
         "keys_file": os.path.join(tmp, "keys.txt"),
         "nodes_state_file": os.path.join(tmp, "nodes.json"),
         "quota_state_file": os.path.join(tmp, "quota.json"),
@@ -298,6 +299,27 @@ class TestTerminalErrors(HttpUxBase):
         # 上游 error body 原样转发, 客户端能看到真实原因
         self.assertIn("FreeUsageLimitError", json.dumps(json.loads(body)))
         self.assertGreaterEqual(int(hdrs["retry-after"]), 1)
+
+
+class TestModelFilter(unittest.TestCase):
+    """上游改名/上下架模型时, 列表必须仍只给客户端能用的项。"""
+
+    def setUp(self):
+        import warp_gateway as wg
+        self.wg = wg
+        self.cfg = {"free_only": True, "model_blacklist": ["jev-1.13-free"]}
+
+    def test_keeps_free_drops_paid_and_blacklisted(self):
+        data = {"data": [{"id": "mimo-v2.6-flash-free"}, {"id": "gpt-6-luna"},
+                         {"id": "jev-1.13-free"}, {"id": "muse-spark-1.3-contributor-free"}]}
+        out = self.wg.filter_models(data, self.cfg)
+        # muse 保留: 它只能走 /responses, 但 responses 客户端需要能发现它
+        self.assertEqual([m["id"] for m in out["data"]],
+                         ["mimo-v2.6-flash-free", "muse-spark-1.3-contributor-free"])
+
+    def test_missing_keys_do_not_crash(self):
+        self.assertEqual(self.wg.filter_models({}, self.cfg), {})
+        self.assertEqual(self.wg.filter_models({"data": "nope"}, self.cfg), {"data": "nope"})
 
 
 if __name__ == "__main__":

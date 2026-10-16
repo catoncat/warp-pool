@@ -61,6 +61,28 @@ ses_ + 12位hex( ~(ts_ms * 4096 + counter) 的低 48 位 ) + 14位base62
 - `first_event_timeout`（默认 15s，覆盖 3 次 keepalive 间隔）只统计"连续无字节"，超时视为节点挂死；
 - **首事件护栏**：首个有效事件（正文 / reasoning / tool_call / finish_reason）之前先攒着不发给客户端，遇 error 事件或超时则直接换节点重试（客户端无感）；已开始出字后不再重放。
 
+## 模型 × 协议矩阵（比 gate 更早撞上的一层）
+
+同一个免费档里，模型的**协议支持不一样**，而且报错信息会把人带偏：
+
+| 模型 | `/chat/completions` | `/responses` | `/messages` |
+|---|---|---|---|
+| `mimo-v2.6-flash-free` 等多数 | ✅ | ❌ 400 | — |
+| `muse-spark-1.2/1.3-contributor-free` | ❌ 400 | ✅（见下） | — |
+| `jev-1.13-free` | ❌ 400 | ❌ 400 | ❌ 400 |
+
+- **`/responses` 还要求至少一个输出控制字段**：不带 `stream_options` 也不带 `max_output_tokens` 时，即使协议选对了也回
+  `400 ModelProtocolUnsupported`（`Model does not support this protocol.`）；补上任意一个即 200。
+- **误导性的 403**：客户端用 `/chat/completions` 请求一个只吃 `/responses` 的模型 → 上游 400 → 网关的
+  "tools 兜底"（去掉 `tools` 重发）命中条件 5 → 变成 `403 FreeTierError`。所以看到 muse 报"免费档只能在 OpenCode 里用"
+  时，真实原因是**协议不对**，不是身份不对 —— 官方 CLI 匿名也能用 muse，就是因为它走 `/responses`。
+- `jev-1.13-free` 三种协议都 400，属于上架但调不通 → 进 `model_blacklist`，不列给客户端。
+
+网关侧：`/v1/responses` 分支补 `stream_options.include_usage`；首事件按 responses 事件语义判定
+（`scan_responses_event()`：`response.output_text.delta` / `response.completed` 等算有效，`response.created` /
+`output_item.added` 只是前导帧，`response.failed` 当错误换节点）；非流式聚合直接把终态事件里上游给的完整 `response`
+对象透传（不自拼，免得漏字段）。
+
 ## 网关侧对应实现
 
 | 条件 | 网关实现 |

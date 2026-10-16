@@ -64,6 +64,9 @@ DEFAULT_CONFIG = {
     "default_quota": 40,          # 未知节点日配额假设(新 IP 2x=40, 从 429 学习修正)
     "quota_ratio": 0.85,          # 成功数达配额该比例即视为「将尽」提前轮换
     "quota_state_file": os.path.join(STATE_DIR, "quota.json"),
+    # 上游已上架但任何协议都调不通的模型, 不回给客户端(免得客户端列表里
+    # 出现"看得见点不动"的项)。只影响 /v1/models 列表, 不拦请求。
+    "model_blacklist": ["jev-1.13-free"],
 }
 
 
@@ -729,6 +732,21 @@ def inject_gate_tools(req: dict) -> None:
     tools.append(json.loads(json.dumps(GATE_READ_TOOL)))
 
 
+def filter_models(data: dict, cfg: dict) -> dict:
+    """过滤上游 /models 的列表: free_only 只留 -free; model_blacklist 拉黑。
+
+    只影响列表, 不拦请求 —— 知道 id 的客户端依旧可以直调。
+    """
+    if not isinstance(data.get("data"), list):
+        return data
+    if cfg.get("free_only"):
+        data["data"] = [m for m in data["data"] if m.get("id", "").endswith("-free")]
+    blocked = set(cfg.get("model_blacklist") or ())
+    if blocked:
+        data["data"] = [m for m in data["data"] if m.get("id") not in blocked]
+    return data
+
+
 def upstream_headers(cfg: dict, ses: str | None = None) -> dict:
     h = {"Content-Type": "application/json", "Accept": "application/json"}
     if cfg.get("spoof_headers"):
@@ -829,11 +847,37 @@ def fetch_upstream(cfg: dict, port: int, path: str, payload: bytes,
     return conn, resp, port
 
 
-def scan_prelude(buf: bytes):
+RESPONSES_ERROR_TYPES = ("response.failed", "error")
+RESPONSES_DELTA_TYPES = (
+    "response.output_text.delta", "response.refusal.delta",
+    "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+    "response.function_call_arguments.delta",
+)
+RESPONSES_FINAL_TYPES = ("response.completed", "response.incomplete")
+
+
+def scan_responses_event(ev: dict):
+    """responses 协议的单个事件 → ("error"|"effective"|"prelude", detail)。
+
+    responses 流的前导帧(created/in_progress/output_item.added)不带内容, 不能算
+    "有效事件"; 真正的信号是各类 delta 或终态事件(completed/incomplete 里带完整
+    response 对象)。
+    """
+    t = ev.get("type") or ""
+    if t in RESPONSES_ERROR_TYPES or ev.get("error"):
+        err = ev.get("error") or ((ev.get("response") or {}).get("error"))
+        msg = err.get("message") if isinstance(err, dict) else (str(err) if err else t)
+        return "error", msg or "upstream responses error"
+    if t in RESPONSES_DELTA_TYPES or t in RESPONSES_FINAL_TYPES:
+        return "effective", None
+    return "prelude", None
+
+
+def scan_prelude(buf: bytes, fmt: str = "chat"):
     """扫描首个"有效事件"之前已到达的 SSE 数据。
 
     返回 (state, detail):
-      "error"     → 上游在给出任何正文前就在流里报错(如配额/限流), 换节点重试
+      "error"     → 上游在给出任何内容前就在流里报错(如配额/限流), 换节点重试
       "effective" → 出现了正文/reasoning/tool_call/finish_reason → 可以提交给客户端
       "prelude"   → 只有 role/usage 之类的前置帧, 继续憋
     只解析完整的 "data: " 行; 半行留给下一轮。
@@ -850,11 +894,18 @@ def scan_prelude(buf: bytes):
             ev = json.loads(data)
         except json.JSONDecodeError:
             continue
-        if isinstance(ev, dict) and ev.get("error"):
+        if not isinstance(ev, dict):
+            continue
+        if fmt == "responses":
+            state, detail = scan_responses_event(ev)
+            if state != "prelude":
+                return state, detail
+            continue
+        if ev.get("error"):
             err = ev["error"]
             msg = err.get("message") if isinstance(err, dict) else str(err)
             return "error", msg or "upstream stream error"
-        for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
+        for ch in ev.get("choices") or []:
             delta = ch.get("delta") or {}
             if (delta.get("content") or delta.get("reasoning_content")
                     or delta.get("tool_calls") or ch.get("finish_reason")):
@@ -872,7 +923,17 @@ def _send_stream_head(handler, port: int):
     handler.close_connection = True
 
 
-def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm=None) -> bool:
+def _send_json(handler, body: bytes, port: int):
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("X-Warp-Pool-Node", str(port))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm=None,
+                 fmt: str = "chat") -> bool:
     """SSE 透传 + 从尾部 chunk 抓 usage。返回 True=已提交给客户端, False=换节点重试。
 
     首事件护栏: 上游可能先回 200 再在流里报错(配额/限流), 或干脆不出帧。在出现第一个
@@ -898,7 +959,7 @@ def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm
                 break
             if not committed:
                 pending += chunk
-                state, _detail = scan_prelude(pending)
+                state, _detail = scan_prelude(pending, fmt)
                 if state == "error":
                     break                      # 未提交 → 换节点
                 if state != "effective":
@@ -929,18 +990,25 @@ def relay_stream(handler, conn, resp, key: str, model: str, port: int, usagenorm
     for line in tail.split(b"\n"):
         if line.startswith(b"data: ") and b'"usage"' in line:
             try:
-                usage = json.loads(line[6:]).get("usage") or usage
+                ev = json.loads(line[6:])
             except json.JSONDecodeError:
-                pass
+                continue
+            if fmt == "responses":
+                usage = (ev.get("response") or {}).get("usage") or ev.get("usage") or usage
+            else:
+                usage = ev.get("usage") or usage
     if usagenorm:
         usage = usagenorm(usage)
     USAGE.record(key, model, usage, estimated=usage is None)
     return True
 
 
-def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagenorm=None) -> bool:
-    """上游强制流式; 客户端要非流式时, 聚合 SSE chunk 还原成 chat.completion JSON。
+def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagenorm=None,
+                    fmt: str = "chat") -> bool:
+    """上游强制流式; 客户端要非流式时聚合 SSE 还原成完整 JSON。
 
+    chat 协议: 还原成 chat.completion; responses 协议: 直接用终态事件里上游给的完整
+    response 对象(不自拼, 免得漏字段)。
     返回 True=已写出响应, False=首事件前就失败(换节点重试)。
     """
     first_timeout = float(CFG.get("first_event_timeout", 0) or 0)
@@ -950,6 +1018,7 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
     tool_calls = {}          # index -> {id, name, arguments}
     finish_reason = None
     usage = None
+    final = None             # responses: 终态事件里的完整 response 对象
     reusable = False
     seen_content = False     # 已拿到正文 → 之后的 error 不再当节点故障
     done_seen = False        # 上游干净收尾: 即使一个字都没出, 也算"正常但空"的回复
@@ -971,6 +1040,8 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
                 if not line.startswith(b"data: "):
                     continue
                 data = line[6:].strip()
+                if not data:
+                    continue
                 if data == b"[DONE]":
                     done_seen = True
                     continue
@@ -978,7 +1049,23 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
                     ev = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(ev, dict) and ev.get("error") and not seen_content:
+                if not isinstance(ev, dict):
+                    continue
+                if fmt == "responses":
+                    state, detail = scan_responses_event(ev)
+                    if state == "error" and not seen_content:
+                        print("[first-event] error event before content: node=%d %s"
+                              % (port, str(detail)[:200]), flush=True)
+                        bail = True
+                        break
+                    if state == "effective":
+                        seen_content = True
+                    if (ev.get("type") or "") in RESPONSES_FINAL_TYPES:
+                        final = ev.get("response") or final
+                        done_seen = True
+                    usage = (ev.get("response") or {}).get("usage") or usage
+                    continue
+                if ev.get("error") and not seen_content:
                     print("[first-event] error event before content: node=%d %s"
                           % (port, str(ev["error"])[:200]), flush=True)
                     bail = True
@@ -1018,10 +1105,17 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
             POOL.drop(port, conn)
     if bail or not (seen_content or done_seen):
         return False    # 一个字都没产出且上游没收尾 → 换节点重试(客户端还没收到任何东西)
-        if reusable and conn.sock:
-            POOL.keep(port, conn)
-        else:
-            POOL.drop(port, conn)
+
+    if fmt == "responses":
+        if final is None:
+            return False    # 流被截断, 没等到终态事件 → 换节点
+        out = dict(final)
+        out.setdefault("model", model)
+        if usagenorm:
+            usage = usagenorm(usage)
+        USAGE.record(key, model, usage, estimated=usage is None)
+        _send_json(handler, json.dumps(out, ensure_ascii=False).encode(), port)
+        return True
 
     message = {"role": "assistant", "content": "".join(content_parts) or None}
     if reasoning_parts:
@@ -1042,13 +1136,7 @@ def relay_aggregate(handler, conn, resp, key: str, model: str, port: int, usagen
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
     USAGE.record(key, model, usage, estimated=usage is None)
-    body = json.dumps(out, ensure_ascii=False).encode()
-    handler.send_response(200)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("X-Warp-Pool-Node", str(port))
-    handler.end_headers()
-    handler.wfile.write(body)
+    _send_json(handler, json.dumps(out, ensure_ascii=False).encode(), port)
     return True
 
 
@@ -1130,10 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._err(resp.status, raw.decode("utf-8", "replace"))
                     return
                 POOL.record_success(port)  # models 请求同样消耗 IP 配额
-                data = json.loads(raw)
-                if CFG.get("free_only") and isinstance(data.get("data"), list):
-                    data["data"] = [m for m in data["data"]
-                                    if m.get("id", "").endswith("-free")]
+                data = filter_models(json.loads(raw), CFG)
                 body = json.dumps(data, ensure_ascii=False).encode()
                 _models_cache.update(ts=now, body=body)
             except (OSError, json.JSONDecodeError) as e:
@@ -1199,8 +1284,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         if is_responses:
-            # responses 协议: gate 同样要求 stream+tools; 工具格式是平铺 {name, parameters}
+            # responses 协议: gate 同样要求 stream+tools; 工具格式是平铺 {name, parameters}。
+            # 上游还要求至少一个输出控制字段(stream_options 或 max_output_tokens), 缺了
+            # 直接 400 ModelProtocolUnsupported; 这里统一补 stream_options(不硬加
+            # max_output_tokens, 免得改客户端想要的输出上限)。
             req["stream"] = True
+            req.setdefault("stream_options", {})["include_usage"] = True
             rtools = req.get("tools")
             if not isinstance(rtools, list):
                 rtools = []
@@ -1212,7 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
             fp = responses_fingerprint(req)
             self._chat_with_retry(key, model, payload, client_stream, fp=fp,
                                   upath="/responses", usagenorm=normalize_responses_usage,
-                                  aggregate=not client_stream)
+                                  aggregate=not client_stream, fmt="responses")
             return
         # pi/Claude 系客户端对 reasoning 模型会发 developer role, zen 只认 system
         for m in req.get("messages", []):
@@ -1236,7 +1325,7 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_with_retry(self, key: str, model: str, payload: bytes,
                          stream: bool, fp: str | None = None,
                          upath: str = "/chat/completions", usagenorm=None,
-                         aggregate: bool = False):
+                         aggregate: bool = False, fmt: str = "chat"):
         """重试循环。SEM 只包「排队→建连→等响应头」(短阶段):
         拿到 200 后立即释放建连槽, 流式转发不占槽 —— 长流不再堵死后续请求。
 
@@ -1315,10 +1404,10 @@ class Handler(BaseHTTPRequestHandler):
                 SEM.release()
                 released = True
                 if aggregate:
-                    ok = relay_aggregate(self, conn, resp, key, model, port, usagenorm)
+                    ok = relay_aggregate(self, conn, resp, key, model, port, usagenorm, fmt=fmt)
                 elif stream or resp.headers.get("Content-Type", "").startswith(
                         "text/event-stream"):
-                    ok = relay_stream(self, conn, resp, key, model, port, usagenorm)
+                    ok = relay_stream(self, conn, resp, key, model, port, usagenorm, fmt=fmt)
                 else:
                     body = resp.read()   # 完整读完 → 归还池复用
                     POOL.keep(port, conn)

@@ -22,6 +22,7 @@
 | `quota_ratio` | `0.85` | 成功数达配额该比例视为「将尽」提前轮换 |
 | `models_cache_sec` | `300` | `/v1/models` 上游结果缓存秒数 |
 | `free_only` | `true` | 只透传 model id 以 `-free` 结尾的模型 |
+| `model_blacklist` | `["jev-1.13-free"]` | 上游已上架但任何协议都调不通的模型，不回给 `/v1/models`（只影响列表，不拦请求） |
 | `spoof_headers` | `true` | 伪装官方 CLI 请求头（协议要求的 `x-<品牌>-*` 头名逐字见代码；上游按这些头判定请求来源） |
 | `opencode_version` | 见代码默认（需近期版本） | 伪装头里的版本号；过旧会被上游拒（426）。键名与 UA 前缀是协议字面量，见 `UPSTREAM_GATE.md` |
 
