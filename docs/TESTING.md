@@ -5,7 +5,7 @@
 ## 一键运行
 
 ```bash
-python3 gateway/tests/run_tests.py             # 单元 63 + 集成 8（默认）
+python3 gateway/tests/run_tests.py             # 单元 63 + 集成 10（默认）
 python3 gateway/tests/run_tests.py --bench     # 单元 + 集成 + 基准
 python3 gateway/tests/run_tests.py --no-live   # 只跑单元（无网络环境）
 python3 gateway/tests/run_tests.py --bench-only
@@ -28,7 +28,7 @@ python3 gateway/tests/run_tests.py --bench-only
 
 每个测试独立 NodePool（`setUp` 重建，环境变量 `WARP_POOL_STATE`/`WARP_GATEWAY_CONFIG` 指向临时目录），杜绝跨测试状态污染。
 
-## 集成测试（`test_live.py`，8 项，真实网关）
+## 集成测试（`test_live.py`，10 项，真实网关）
 
 默认 `http://127.0.0.1:10900`（生产隧道）；`--gateway`/`--key` 可覆盖。
 模型 id 从 `GET /v1/models` 挑（首选列表见 `test_live.py`），不硬编码 —— 上游改过名，硬编码会让整轮集成测试假失败。
@@ -40,6 +40,8 @@ python3 gateway/tests/run_tests.py --bench-only
 5. 同对话（固定前缀 + 轮次追加）→ `X-Warp-Pool-Node` 全部相同（硬断言）
 6. 不同对话 → 节点分散 ≥ 2（硬断言）
 7. 缓存命中：同 prompt ~960 tokens 重复 3 次 → 第 2/3 次 `cached_tokens` > miss（核心承诺硬断言）
+8. `POST /v1/responses` 非流式 → 200 且 body 是 responses 格式（`object=response`）—— 只有部分上游模型支持该协议，这条路径曾被静默打坏；列表里无此类模型时跳过（不假失败）
+9. `POST /v1/responses` 流式 → 200 且含 `response.completed` + `output_text.delta`
 
 > 注意：对真实上游会消耗少量日配额（约 15 请求/轮），25 节点日配额 1000+，可放心跑。
 

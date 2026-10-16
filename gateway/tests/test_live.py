@@ -213,6 +213,39 @@ def main():
     check("缓存命中(重复请求)", hit_ok,
           "演进=" + ",".join("hit=%d/miss=%d" % h for h in hits))
 
+    # 7) responses 协议: 只吃该协议的模型(如 muse-spark)经网关必须可用。
+    #    实测过: 上游里只有部分模型支持 /responses, 其余走它一律 400; 而这条路径
+    #    长期没有 live 覆盖, 曾被静默打坏(某次改动后 muse 全部 503)。
+    status, h, b = g.req_raw("GET", "/v1/models", None, timeout=10)
+    ids = [m.get("id", "") for m in json.loads(b).get("data", [])] if status == 200 else []
+    resp_model = next((m for m in ids if "muse-spark" in m), None)
+    ri = [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: ok"}]}]
+    if resp_model is None:
+        check("responses 协议(列表无 responses 模型, 跳过)", True, "跳过")
+    else:
+        status, h, b = g.req("POST", "/responses",
+                             {"model": resp_model, "input": ri, "stream": False,
+                              "max_output_tokens": 300})
+        ok, detail = False, "status=%s %s" % (status, b[:120])
+        try:
+            o = json.loads(b)
+            txt = "".join(c.get("text", "") for it in o.get("output", [])
+                          for c in (it.get("content") or []))
+            # 必须是 responses 格式(object=response), 不是 chat.completion
+            ok = status == 200 and o.get("object") == "response" and "ok" in txt.lower()
+            detail = "status=%s body_status=%s 文本=%r" % (status, o.get("status"), txt[:30])
+        except Exception:
+            pass
+        check("responses 非流式(只吃该协议的模型)", ok, detail)
+
+        status, h, b = g.req("POST", "/responses",
+                             {"model": resp_model, "input": ri, "stream": True,
+                              "max_output_tokens": 300})
+        check("responses 流式",
+              status == 200 and b"response.completed" in b and b"output_text.delta" in b,
+              "status=%s 首帧=%r" % (status,
+                                  next((ln for ln in b.split(b"\n") if ln.startswith(b"event: ")), b"")[:40]))
+
     print()
     print("集成测试结果: %d 过 / %d 失败" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
